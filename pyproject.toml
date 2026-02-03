@@ -1,0 +1,28 @@
+[project]
+name = "reflect"
+version = "0.1.0"
+description = "Security testing tool for mobile apps using Metamorphic Testing"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1.0",      # CLI framework - easy to create commands
+    "rich>=13.0.0",      # Beautiful terminal output (colors, tables, progress)
+    "pyyaml>=6.0.0",     # Parse YAML files (Maestro flows)
+    "mitmproxy>=10.0.0", # Network interception proxy
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+reflect = "reflect.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
