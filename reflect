@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Reflect - Security testing tool for mobile apps
+# This wrapper allows running: ./reflect test --apk app.apk
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 -m reflect "$@"
