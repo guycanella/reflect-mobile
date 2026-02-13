@@ -14,7 +14,7 @@ console = Console()
 
 @click.group()
 @click.version_option(version=__version__, prog_name="Reflect")
-def main():
+def cli():
     """
     Reflect - Security testing tool for mobile apps.
 
@@ -24,7 +24,7 @@ def main():
     pass
 
 
-@main.command()
+@cli.command()
 @click.option(
     "--apk",
     type=click.Path(exists=True),
@@ -81,7 +81,7 @@ def test(apk, ipa, mr, report):
     console.print("[dim]Next step: implement orchestrator.py[/dim]")
 
 
-@main.command(name="list")
+@cli.command(name="list")
 def list_mrs():
     """
     List all available Metamorphic Relations (tests).
@@ -110,7 +110,7 @@ def list_mrs():
     console.print()
 
 
-@main.command()
+@cli.command()
 def info():
     """
     Show information about the testing environment.
@@ -134,4 +134,4 @@ def info():
 
 # Entry point when running with: python -m reflect
 if __name__ == "__main__":
-    main()
+    cli()
