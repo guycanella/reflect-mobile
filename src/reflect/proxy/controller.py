@@ -1,471 +1,483 @@
 """
-Android emulator controller for Reflect.
+Mitmproxy controller for Reflect.
 
-Handles AVD management, emulator lifecycle, and device configuration.
+Handles traffic interception, certificate manipulation, and token capture
+for metamorphic security testing.
 """
 
 import subprocess
 import time
-import re
+import json
 from typing import Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
+from enum import Enum
+
+
+class ProxyMode(Enum):
+    """Proxy operation modes for different MR tests."""
+    PASSTHROUGH = "passthrough"      # Normal traffic, just observe
+    REJECT_INVALID_CERT = "reject"   # MR1: Reject if app accepts bad certs
+    FORCE_HTTP = "http"              # MR4: Downgrade HTTPS to HTTP
+    CAPTURE_TOKENS = "capture"       # MR2/MR3: Capture Access Tokens
 
 
 @dataclass
-class EmulatorStatus:
-    """Status of an Android emulator instance."""
+class CapturedToken:
+    """Represents a captured authentication token."""
+    token: str
+    token_type: str  # "bearer", "session", etc.
+    endpoint: str
+    timestamp: float
+    headers: dict = field(default_factory=dict)
+
+
+@dataclass 
+class ProxyStatus:
+    """Status of the mitmproxy instance."""
     running: bool
-    device_id: Optional[str] = None
-    avd_name: Optional[str] = None
+    port: int = 8080
+    mode: ProxyMode = ProxyMode.PASSTHROUGH
+    pid: Optional[int] = None
 
 
-class AndroidEmulator:
+class MitmproxyController:
     """
-    Controls Android emulator for security testing.
+    Controls mitmproxy for security testing.
     
-    Provides methods to start/stop emulator, install apps,
-    and configure proxy settings for traffic interception.
+    Supports different modes for testing various vulnerabilities:
+    - Certificate validation (MR1)
+    - Encryption requirements (MR4)
+    - Token capture for session testing (MR2, MR3)
     """
     
-    def __init__(self, avd_name: str = "reflect-test"):
+    DEFAULT_PORT = 8080
+    CERTS_DIR = Path.home() / ".mitmproxy"
+    
+    def __init__(self, port: int = DEFAULT_PORT):
         """
-        Initialize emulator controller.
+        Initialize mitmproxy controller.
         
         Args:
-            avd_name: Name of the AVD to use (default: reflect-test)
+            port: Port for proxy to listen on (default: 8080)
         """
-        self.avd_name = avd_name
-        self._emulator_process: Optional[subprocess.Popen] = None
-        self._device_id: Optional[str] = None
+        self.port = port
+        self._process: Optional[subprocess.Popen] = None
+        self._mode: ProxyMode = ProxyMode.PASSTHROUGH
+        self._captured_tokens: list[CapturedToken] = []
+        self._script_path: Optional[Path] = None
     
-    @staticmethod
-    def list_avds() -> list[str]:
+    def get_status(self) -> ProxyStatus:
         """
-        List all available Android Virtual Devices.
+        Get current proxy status.
         
         Returns:
-            List of AVD names
+            ProxyStatus with running state and configuration
         """
-        try:
-            result = subprocess.run(
-                ["emulator", "-list-avds"],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            avds = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
-            return avds
-        except subprocess.CalledProcessError:
-            return []
-        except FileNotFoundError:
-            raise RuntimeError("Android emulator not found. Is ANDROID_HOME configured?")
-    
-    @staticmethod
-    def list_running_devices() -> list[str]:
-        """
-        List all connected/running Android devices.
-        
-        Returns:
-            List of device IDs (e.g., ['emulator-5554'])
-        """
-        try:
-            result = subprocess.run(
-                ["adb", "devices"],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            devices = []
-            for line in result.stdout.strip().split("\n")[1:]:
-                if "\tdevice" in line:
-                    device_id = line.split("\t")[0]
-                    devices.append(device_id)
-            return devices
-        except subprocess.CalledProcessError:
-            return []
-    
-    def get_status(self) -> EmulatorStatus:
-        """
-        Get current emulator status.
-        
-        Returns:
-            EmulatorStatus with running state and device info
-        """
-        devices = self.list_running_devices()
-        
-        if not devices:
-            return EmulatorStatus(running=False)
-        
-        for device_id in devices:
-            avd = self._get_device_avd_name(device_id)
-            if avd == self.avd_name:
-                self._device_id = device_id
-                return EmulatorStatus(
-                    running=True,
-                    device_id=device_id,
-                    avd_name=avd
-                )
-        
-        return EmulatorStatus(
-            running=True,
-            device_id=devices[0],
-            avd_name=self._get_device_avd_name(devices[0])
+        running = self._process is not None and self._process.poll() is None
+        return ProxyStatus(
+            running=running,
+            port=self.port,
+            mode=self._mode,
+            pid=self._process.pid if running else None
         )
     
-    def _get_device_avd_name(self, device_id: str) -> Optional[str]:
+    def start(self, mode: ProxyMode = ProxyMode.PASSTHROUGH) -> None:
         """
-        Get AVD name for a running device.
+        Start mitmproxy with specified mode.
         
         Args:
-            device_id: Device ID (e.g., emulator-5554)
-            
-        Returns:
-            AVD name or None if not found
-        """
-        try:
-            result = subprocess.run(
-                ["adb", "-s", device_id, "emu", "avd", "name"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result.returncode == 0:
-                return result.stdout.strip().split("\n")[0]
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            pass
-        return None
-    
-    def start(self, headless: bool = False, proxy_port: Optional[int] = None) -> str:
-        """
-        Start the Android emulator.
-        
-        Args:
-            headless: Run without GUI window (for CI/CD)
-            proxy_port: Port for HTTP proxy (e.g., 8080 for mitmproxy)
-            
-        Returns:
-            Device ID of the started emulator
+            mode: Operation mode for the proxy
             
         Raises:
-            RuntimeError: If emulator fails to start
+            RuntimeError: If proxy fails to start
         """
-        status = self.get_status()
-        if status.running and status.avd_name == self.avd_name:
-            self._device_id = status.device_id
-            return status.device_id
-        
-        if self.avd_name not in self.list_avds():
-            raise RuntimeError(f"AVD '{self.avd_name}' not found. Available: {self.list_avds()}")
-        
-        cmd = ["emulator", "-avd", self.avd_name]
-        
-        if headless:
-            cmd.extend(["-no-window", "-no-audio"])
-        
-        if proxy_port:
-            cmd.extend(["-http-proxy", f"http://127.0.0.1:{proxy_port}"])
-        
-        cmd.extend(["-no-snapshot-save", "-no-boot-anim"])
-        
-        self._emulator_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        
-        if not self._wait_for_boot(timeout=120):
+        # Stop existing instance
+        if self.get_status().running:
             self.stop()
-            raise RuntimeError("Emulator failed to boot within timeout")
         
-        devices = self.list_running_devices()
-        if devices:
-            self._device_id = devices[0]
-            return self._device_id
+        self._mode = mode
         
-        raise RuntimeError("Emulator started but no device found")
+        # Build command based on mode
+        cmd = ["mitmdump", "-p", str(self.port), "--ssl-insecure"]
+        
+        # Add mode-specific script
+        script_content = self._generate_script(mode)
+        if script_content:
+            self._script_path = Path("/tmp/reflect_proxy_script.py")
+            self._script_path.write_text(script_content)
+            cmd.extend(["-s", str(self._script_path)])
+        
+        # Add mode-specific options
+        if mode == ProxyMode.FORCE_HTTP:
+            # Strip HTTPS, allow HTTP
+            cmd.append("--set")
+            cmd.append("upstream_cert=false")
+        
+        # Start mitmproxy
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+            
+            # Wait for proxy to be ready
+            if not self._wait_for_ready(timeout=10):
+                self.stop()
+                raise RuntimeError("Mitmproxy failed to start")
+                
+        except FileNotFoundError:
+            raise RuntimeError("mitmproxy not found. Install with: pip install mitmproxy")
     
-    def _wait_for_boot(self, timeout: int = 120) -> bool:
+    def _wait_for_ready(self, timeout: int = 10) -> bool:
         """
-        Wait for emulator to fully boot.
+        Wait for mitmproxy to be ready to accept connections.
         
         Args:
             timeout: Maximum seconds to wait
             
         Returns:
-            True if booted successfully, False otherwise
+            True if ready, False if timeout
         """
-        start_time = time.time()
+        import socket
         
+        start_time = time.time()
         while time.time() - start_time < timeout:
             try:
-                devices = self.list_running_devices()
-                if not devices:
-                    time.sleep(2)
-                    continue
-                
-                result = subprocess.run(
-                    ["adb", "-s", devices[0], "shell", "getprop", "sys.boot_completed"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                
-                if result.stdout.strip() == "1":
-                    time.sleep(3)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(1)
+                result = sock.connect_ex(('127.0.0.1', self.port))
+                sock.close()
+                if result == 0:
                     return True
-                    
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            except socket.error:
                 pass
-            
-            time.sleep(2)
+            time.sleep(0.5)
         
         return False
     
     def stop(self) -> None:
-        """Stop the emulator."""
-        if self._device_id:
+        """Stop mitmproxy."""
+        if self._process:
+            self._process.terminate()
             try:
-                subprocess.run(
-                    ["adb", "-s", self._device_id, "emu", "kill"],
-                    capture_output=True,
-                    timeout=10
-                )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-                pass
-        
-        if self._emulator_process:
-            self._emulator_process.terminate()
-            try:
-                self._emulator_process.wait(timeout=10)
+                self._process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self._emulator_process.kill()
-            self._emulator_process = None
+                self._process.kill()
+            self._process = None
         
-        self._device_id = None
+        # Cleanup script
+        if self._script_path and self._script_path.exists():
+            self._script_path.unlink()
+            self._script_path = None
+        
+        self._mode = ProxyMode.PASSTHROUGH
     
-    def install_apk(self, apk_path: str) -> None:
+    def _generate_script(self, mode: ProxyMode) -> Optional[str]:
         """
-        Install an APK on the emulator.
+        Generate mitmproxy addon script for the specified mode.
         
         Args:
-            apk_path: Path to the APK file
+            mode: Proxy operation mode
+            
+        Returns:
+            Python script content or None if no script needed
+        """
+        if mode == ProxyMode.PASSTHROUGH:
+            return None
+        
+        if mode == ProxyMode.REJECT_INVALID_CERT:
+            return self._script_reject_invalid_cert()
+        
+        if mode == ProxyMode.FORCE_HTTP:
+            return self._script_force_http()
+        
+        if mode == ProxyMode.CAPTURE_TOKENS:
+            return self._script_capture_tokens()
+        
+        return None
+    
+    def _script_reject_invalid_cert(self) -> str:
+        """Script to test if app validates certificates (MR1)."""
+        return '''
+"""MR1: Test certificate validation - inject invalid certificate."""
+from mitmproxy import ctx, http
+import json
+
+class InvalidCertInjector:
+    """
+    Injects responses as if using an invalid certificate.
+    
+    If the app properly validates certificates, it should reject
+    connections and show an error. If vulnerable, it will accept.
+    """
+    
+    def __init__(self):
+        self.requests_made = []
+    
+    def request(self, flow: http.HTTPFlow) -> None:
+        # Log all auth-related requests
+        if any(kw in flow.request.pretty_url.lower() for kw in 
+               ["login", "auth", "token", "signin", "session"]):
+            self.requests_made.append({
+                "url": flow.request.pretty_url,
+                "method": flow.request.method,
+                "timestamp": flow.request.timestamp_start
+            })
+            ctx.log.info(f"Auth request intercepted: {flow.request.pretty_url}")
+    
+    def response(self, flow: http.HTTPFlow) -> None:
+        # Log successful auth responses (indicates vulnerability)
+        if flow.response and flow.response.status_code == 200:
+            if any(kw in flow.request.pretty_url.lower() for kw in 
+                   ["login", "auth", "token", "signin"]):
+                ctx.log.warn(f"VULNERABILITY: Auth succeeded with invalid cert!")
+                # Write to file for test oracle
+                with open("/tmp/reflect_mr1_result.json", "w") as f:
+                    json.dump({
+                        "vulnerable": True,
+                        "url": flow.request.pretty_url,
+                        "status": flow.response.status_code
+                    }, f)
+
+addons = [InvalidCertInjector()]
+'''
+    
+    def _script_force_http(self) -> str:
+        """Script to force HTTP and detect unencrypted credentials (MR4)."""
+        return '''
+"""MR4: Test encryption requirements - force HTTP downgrade."""
+from mitmproxy import ctx, http
+import json
+
+class HttpDowngrader:
+    """
+    Forces HTTPS requests to HTTP to test if app encrypts credentials.
+    
+    If the app properly requires HTTPS, it should refuse to send
+    credentials over HTTP. If vulnerable, credentials will be visible.
+    """
+    
+    def __init__(self):
+        self.credentials_captured = []
+    
+    def request(self, flow: http.HTTPFlow) -> None:
+        # Check if credentials are being sent over HTTP
+        if flow.request.scheme == "http":
+            # Look for credentials in request
+            body = flow.request.get_text() or ""
+            headers = dict(flow.request.headers)
+            
+            has_credentials = any([
+                "password" in body.lower(),
+                "passwd" in body.lower(),
+                "secret" in body.lower(),
+                "authorization" in str(headers).lower(),
+            ])
+            
+            if has_credentials:
+                ctx.log.warn(f"VULNERABILITY: Credentials sent over HTTP!")
+                self.credentials_captured.append({
+                    "url": flow.request.pretty_url,
+                    "method": flow.request.method,
+                    "has_password_field": "password" in body.lower()
+                })
+                
+                # Write result for test oracle
+                with open("/tmp/reflect_mr4_result.json", "w") as f:
+                    json.dump({
+                        "vulnerable": True,
+                        "credentials_exposed": len(self.credentials_captured),
+                        "details": self.credentials_captured
+                    }, f)
+    
+    def responseheaders(self, flow: http.HTTPFlow) -> None:
+        # Downgrade HTTPS redirects to HTTP
+        if flow.response and flow.response.status_code in [301, 302, 307, 308]:
+            location = flow.response.headers.get("Location", "")
+            if location.startswith("https://"):
+                flow.response.headers["Location"] = location.replace("https://", "http://", 1)
+                ctx.log.info(f"Downgraded redirect to HTTP: {location}")
+
+addons = [HttpDowngrader()]
+'''
+    
+    def _script_capture_tokens(self) -> str:
+        """Script to capture authentication tokens (MR2/MR3)."""
+        return '''
+"""MR2/MR3: Capture authentication tokens for session testing."""
+from mitmproxy import ctx, http
+import json
+import re
+import time
+
+class TokenCapture:
+    """
+    Captures authentication tokens from responses.
+    
+    Used for:
+    - MR2: Check if token changes after inactivity
+    - MR3: Check if token changes after logout/re-login
+    """
+    
+    TOKEN_FILE = "/tmp/reflect_captured_tokens.json"
+    
+    def __init__(self):
+        self.tokens = []
+    
+    def response(self, flow: http.HTTPFlow) -> None:
+        # Check response headers for tokens
+        auth_header = flow.response.headers.get("Authorization", "")
+        set_cookie = flow.response.headers.get("Set-Cookie", "")
+        
+        # Check response body for tokens
+        try:
+            body = flow.response.get_text() or ""
+            body_json = json.loads(body) if body.startswith("{") else {}
+        except:
+            body_json = {}
+        
+        token_data = None
+        
+        # Extract Bearer token from header
+        if "bearer" in auth_header.lower():
+            token_data = {
+                "token": auth_header,
+                "type": "bearer_header",
+                "source": "response_header"
+            }
+        
+        # Extract token from JSON response
+        for key in ["access_token", "token", "accessToken", "auth_token", "jwt"]:
+            if key in body_json:
+                token_data = {
+                    "token": str(body_json[key]),
+                    "type": key,
+                    "source": "response_body"
+                }
+                break
+        
+        # Extract session cookie
+        if "session" in set_cookie.lower() or "token" in set_cookie.lower():
+            token_data = {
+                "token": set_cookie.split(";")[0],
+                "type": "session_cookie",
+                "source": "set_cookie"
+            }
+        
+        if token_data:
+            token_data["url"] = flow.request.pretty_url
+            token_data["timestamp"] = time.time()
+            self.tokens.append(token_data)
+            
+            ctx.log.info(f"Token captured: {token_data['type']} from {token_data['url']}")
+            
+            # Save to file
+            with open(self.TOKEN_FILE, "w") as f:
+                json.dump(self.tokens, f, indent=2)
+
+addons = [TokenCapture()]
+'''
+    
+    def get_certificate_path(self) -> Path:
+        """
+        Get path to mitmproxy CA certificate.
+        
+        Returns:
+            Path to the certificate file
             
         Raises:
-            RuntimeError: If installation fails
+            RuntimeError: If certificate not found
         """
-        if not self._device_id:
-            raise RuntimeError("Emulator not running. Call start() first.")
+        cert_path = self.CERTS_DIR / "mitmproxy-ca-cert.pem"
         
-        try:
-            result = subprocess.run(
-                ["adb", "-s", self._device_id, "install", "-r", "-g", apk_path],
-                capture_output=True,
-                text=True,
-                timeout=60
+        if not cert_path.exists():
+            # Generate certificates by starting/stopping mitmproxy
+            self.start(ProxyMode.PASSTHROUGH)
+            time.sleep(2)
+            self.stop()
+        
+        if not cert_path.exists():
+            raise RuntimeError(
+                f"Mitmproxy certificate not found at {cert_path}. "
+                "Try running 'mitmproxy' manually once to generate certificates."
             )
-            
-            if "Success" not in result.stdout:
-                raise RuntimeError(f"APK installation failed: {result.stderr}")
-                
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("APK installation timed out")
+        
+        return cert_path
     
-    def uninstall_app(self, package_name: str) -> None:
+    def get_captured_tokens(self) -> list[dict]:
         """
-        Uninstall an app from the emulator.
-        
-        Args:
-            package_name: App package name (e.g., com.example.app)
-        """
-        if not self._device_id:
-            return
-        
-        try:
-            subprocess.run(
-                ["adb", "-s", self._device_id, "uninstall", package_name],
-                capture_output=True,
-                timeout=30
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            pass
-    
-    def set_proxy(self, host: str = "127.0.0.1", port: int = 8080) -> None:
-        """
-        Configure HTTP proxy on the emulator.
-        
-        This routes all HTTP/HTTPS traffic through the proxy (mitmproxy).
-        
-        Args:
-            host: Proxy host address
-            port: Proxy port
-        """
-        if not self._device_id:
-            raise RuntimeError("Emulator not running. Call start() first.")
-        
-        subprocess.run(
-            ["adb", "-s", self._device_id, "shell", "settings", "put", "global", 
-             "http_proxy", f"{host}:{port}"],
-            capture_output=True,
-            check=True
-        )
-    
-    def clear_proxy(self) -> None:
-        """Remove proxy configuration from the emulator."""
-        if not self._device_id:
-            return
-        
-        subprocess.run(
-            ["adb", "-s", self._device_id, "shell", "settings", "put", "global", 
-             "http_proxy", ":0"],
-            capture_output=True
-        )
-    
-    def install_certificate(self, cert_path: str) -> None:
-        """
-        Install a CA certificate on the emulator.
-        
-        Required for mitmproxy to intercept HTTPS traffic.
-        
-        Args:
-            cert_path: Path to the certificate file (.pem or .cer)
-        """
-        if not self._device_id:
-            raise RuntimeError("Emulator not running. Call start() first.")
-        
-        cert_hash = self._get_cert_hash(cert_path)
-        
-        remote_path = f"/sdcard/{cert_hash}.0"
-        subprocess.run(
-            ["adb", "-s", self._device_id, "push", cert_path, remote_path],
-            capture_output=True,
-            check=True
-        )
-        
-        commands = [
-            "su -c 'mount -o rw,remount /system'",
-            f"su -c 'cp {remote_path} /system/etc/security/cacerts/{cert_hash}.0'",
-            f"su -c 'chmod 644 /system/etc/security/cacerts/{cert_hash}.0'",
-            f"rm {remote_path}"
-        ]
-        
-        for cmd in commands:
-            subprocess.run(
-                ["adb", "-s", self._device_id, "shell", cmd],
-                capture_output=True
-            )
-    
-    def _get_cert_hash(self, cert_path: str) -> str:
-        """
-        Get OpenSSL subject hash for certificate naming.
-        
-        Args:
-            cert_path: Path to certificate file
-            
-        Returns:
-            Certificate hash string
-        """
-        try:
-            result = subprocess.run(
-                ["openssl", "x509", "-inform", "PEM", "-subject_hash_old", 
-                 "-in", cert_path, "-noout"],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            return result.stdout.strip()
-        except subprocess.CalledProcessError:
-            # Fallback: use simple hash
-            return "9a5ba575"  # Default mitmproxy cert hash
-    
-    def take_screenshot(self, output_path: str) -> None:
-        """
-        Take a screenshot of the emulator.
-        
-        Useful for debugging test failures.
-        
-        Args:
-            output_path: Where to save the screenshot
-        """
-        if not self._device_id:
-            raise RuntimeError("Emulator not running")
-        
-        # Capture on device
-        subprocess.run(
-            ["adb", "-s", self._device_id, "shell", "screencap", "-p", "/sdcard/screen.png"],
-            capture_output=True,
-            check=True
-        )
-        
-        # Pull to local machine
-        subprocess.run(
-            ["adb", "-s", self._device_id, "pull", "/sdcard/screen.png", output_path],
-            capture_output=True,
-            check=True
-        )
-        
-        # Cleanup
-        subprocess.run(
-            ["adb", "-s", self._device_id, "shell", "rm", "/sdcard/screen.png"],
-            capture_output=True
-        )
-    
-    def get_installed_packages(self) -> list[str]:
-        """
-        List all installed packages on the emulator.
+        Get tokens captured during CAPTURE_TOKENS mode.
         
         Returns:
-            List of package names
+            List of captured token data
         """
-        if not self._device_id:
-            return []
+        token_file = Path("/tmp/reflect_captured_tokens.json")
+        if token_file.exists():
+            try:
+                return json.loads(token_file.read_text())
+            except json.JSONDecodeError:
+                return []
+        return []
+    
+    def get_mr1_result(self) -> Optional[dict]:
+        """
+        Get result from MR1 (certificate validation) test.
         
-        try:
-            result = subprocess.run(
-                ["adb", "-s", self._device_id, "shell", "pm", "list", "packages"],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            
-            packages = []
-            for line in result.stdout.strip().split("\n"):
-                if line.startswith("package:"):
-                    packages.append(line.replace("package:", ""))
-            return packages
-            
-        except subprocess.CalledProcessError:
-            return []
+        Returns:
+            Result dict or None if no result
+        """
+        result_file = Path("/tmp/reflect_mr1_result.json")
+        if result_file.exists():
+            try:
+                return json.loads(result_file.read_text())
+            except json.JSONDecodeError:
+                return None
+        return None
+    
+    def get_mr4_result(self) -> Optional[dict]:
+        """
+        Get result from MR4 (HTTP downgrade) test.
+        
+        Returns:
+            Result dict or None if no result
+        """
+        result_file = Path("/tmp/reflect_mr4_result.json")
+        if result_file.exists():
+            try:
+                return json.loads(result_file.read_text())
+            except json.JSONDecodeError:
+                return None
+        return None
+    
+    def clear_results(self) -> None:
+        """Clear all captured results and tokens."""
+        for f in [
+            "/tmp/reflect_mr1_result.json",
+            "/tmp/reflect_mr4_result.json",
+            "/tmp/reflect_captured_tokens.json"
+        ]:
+            path = Path(f)
+            if path.exists():
+                path.unlink()
+        
+        self._captured_tokens = []
 
 
-# Convenience function for quick status check
-def check_environment() -> dict:
+def check_mitmproxy_installed() -> bool:
     """
-    Check if Android development environment is properly configured.
+    Check if mitmproxy is installed and accessible.
     
     Returns:
-        Dict with status of each component
+        True if installed, False otherwise
     """
-    status = {}
-    
     try:
-        result = subprocess.run(["adb", "version"], capture_output=True, text=True)
-        status["adb"] = "installed" if result.returncode == 0 else "error"
+        result = subprocess.run(
+            ["mitmdump", "--version"],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0
     except FileNotFoundError:
-        status["adb"] = "not found"
-    
-    try:
-        result = subprocess.run(["emulator", "-version"], capture_output=True, text=True)
-        status["emulator"] = "installed" if result.returncode == 0 else "error"
-    except FileNotFoundError:
-        status["emulator"] = "not found"
-    
-    try:
-        avds = AndroidEmulator.list_avds()
-        status["avds"] = avds if avds else "none created"
-    except RuntimeError:
-        status["avds"] = "error"
-    
-    devices = AndroidEmulator.list_running_devices()
-    status["running_devices"] = devices if devices else "none"
-    
-    return status
+        return False

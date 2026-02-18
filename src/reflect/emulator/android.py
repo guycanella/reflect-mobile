@@ -454,7 +454,6 @@ class AndroidEmulator:
             return []
 
 
-# Convenience function for quick status check
 def check_environment() -> dict:
     """
     Check if Android development environment is properly configured.
